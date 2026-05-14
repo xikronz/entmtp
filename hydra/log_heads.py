@@ -100,6 +100,7 @@ def _empty_hydra_head_features(row: dict, num_heads: int) -> None:
         row[f"{prefix}_top10_prob"] = ""
         row[f"{prefix}_prob_gap"] = ""
         row[f"{prefix}_entropy"] = ""
+        row[f"{prefix}_num_paths"] = ""
         row[f"base_{prefix}_top1_agree"] = ""
         row[f"base_{prefix}_top5_overlap"] = ""
         row[f"base_{prefix}_top10_overlap"] = ""
@@ -116,14 +117,20 @@ def _empty_hydra_head_features(row: dict, num_heads: int) -> None:
 def _hydra_head_logits_for_block_start(model, base_hidden_states: torch.Tensor) -> torch.Tensor | None:
     """Return [num_heads, vocab] Hydra-head logits for the current block start.
 
-    This mirrors the ungrounded MLP/prefix-MLP proposal path. Grounded and
-    attention heads build logits autoregressively through candidate paths, so a
-    single branch-independent block-start diagnostic is not well-defined there.
+    Prefer logits captured inside proposal(), because grounded heads are
+    path-dependent and their logits are otherwise not available without redoing
+    proposal work.
     """
     hydra_head = model.hydra_head
-    if getattr(hydra_head, "grounded_heads", False):
-        return None
+    debug = getattr(hydra_head, "last_proposal_debug", None)
+    if isinstance(debug, dict) and debug.get("head_logits") is not None:
+        return debug["head_logits"]
+
+    # Fallback for older ungrounded MLP/prefix-MLP heads if proposal debug is
+    # unavailable. Grounded/attention heads must be instrumented inside proposal.
     if model.hydra_head_arch not in {"mlp", "prefix-mlp"}:
+        return None
+    if getattr(hydra_head, "grounded_heads", False):
         return None
 
     head_logits = []
@@ -146,6 +153,10 @@ def _add_hydra_head_features(
     head_logits = _hydra_head_logits_for_block_start(model, base_hidden_states)
     if head_logits is None:
         return
+    debug = getattr(model.hydra_head, "last_proposal_debug", None)
+    debug_num_paths = []
+    if isinstance(debug, dict):
+        debug_num_paths = list(debug.get("head_num_paths") or [])
 
     base_logits = base_logits.float()
     base_top10_vals, base_top10_ids = torch.topk(
@@ -183,6 +194,9 @@ def _add_hydra_head_features(
         row[f"{prefix}_top1_token_id"] = top_ids[-1]
         row[f"{prefix}_top1_prob"] = top_probs[-1]
         row[f"{prefix}_entropy"] = entropy
+        row[f"{prefix}_num_paths"] = (
+            int(debug_num_paths[head_idx]) if head_idx < len(debug_num_paths) else ""
+        )
         row[f"base_{prefix}_top1_agree"] = int(base_top1_id == top_ids[-1])
         row[f"base_{prefix}_top5_overlap"] = len(base_top5 & head_top5) / max(len(base_top5), 1)
         row[f"base_{prefix}_top10_overlap"] = len(base_top10 & head_top10) / max(len(base_top10), 1)
@@ -501,17 +515,17 @@ def run_hydra_generation_with_logging(
             step_entropies.append(block_start_entropy)
             block_start_logits = logits[0, -1].detach()
             block_start_hidden = hidden_states[0, -1].detach()
+
+            to_pass_input_ids = input_ids if idx == 0 else None
+            candidates, tree_candidates = model.hydra_head.proposal(
+                logits, hidden_states, hydra_buffers, past_key_values, to_pass_input_ids
+            )
             hydra_head_features: dict = {}
             _add_hydra_head_features(
                 hydra_head_features,
                 model,
                 block_start_logits,
                 hidden_states,
-            )
-
-            to_pass_input_ids = input_ids if idx == 0 else None
-            candidates, tree_candidates = model.hydra_head.proposal(
-                logits, hidden_states, hydra_buffers, past_key_values, to_pass_input_ids
             )
             hidden_states, logits = tree_decoding(
                 model,

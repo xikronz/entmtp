@@ -148,6 +148,10 @@ class HydraPrefixMLP(nn.Module):
             hydra_hidden_state = self.hydra_mlp[i](base_hidden_states)
             hydra_logits.append(self.hydra_lm_head[i](hydra_hidden_state))
         hydra_logits = torch.stack(hydra_logits, dim=0)
+        self.last_proposal_debug = {
+            "head_logits": hydra_logits[:, 0, -1].detach(),
+            "head_num_paths": [1 for _ in range(self.hydra_num_heads)],
+        }
 
         # Greedy decoding: Select the most probable candidate from the original logits.
         candidates_logit = torch.argmax(input_logits[:, -1]).unsqueeze(0)
@@ -178,6 +182,8 @@ class HydraPrefixMLP(nn.Module):
         children_per_head = hydra_buffers["children_per_head"]
         children_to_expand_per_head = hydra_buffers["children_to_expand_per_head"]
         retrieve_indices = hydra_buffers["retrieve_indices"]
+        debug_head_logits = []
+        debug_num_paths = []
 
         # Build prefix through attn layer 
         # Fixed to only one layer currently
@@ -202,6 +208,10 @@ class HydraPrefixMLP(nn.Module):
         for head_idx, (head_num_children, head_children_to_expand) in enumerate(zip(children_per_head, children_to_expand_per_head)):
             hydra_hidden_state = self.hydra_mlp[head_idx](candidates_embeddings)
             hydra_preds = self.hydra_lm_head[head_idx](hydra_hidden_state)
+            # Grounded heads are path-dependent. Log the first/greedy parent path
+            # distribution, which is the branch expanded first by the proposal.
+            debug_head_logits.append(hydra_preds[0, 0].detach())
+            debug_num_paths.append(int(hydra_preds.shape[1]))
             next_head_embeddings = []
 
             for path_idx, (num_children, children_to_expand) in enumerate(zip(head_num_children, head_children_to_expand)):
@@ -221,6 +231,10 @@ class HydraPrefixMLP(nn.Module):
 
         # TODO (Zack): Only selecting first batch element for now, change when doing bs > 1
         cart_candidates = candidates[0, retrieve_indices]
+        self.last_proposal_debug = {
+            "head_logits": torch.stack(debug_head_logits, dim=0),
+            "head_num_paths": debug_num_paths,
+        }
 
         return cart_candidates, candidates
     
