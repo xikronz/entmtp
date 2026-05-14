@@ -91,6 +91,117 @@ def _add_distribution_shape_features(row: dict, prefix: str, logits: torch.Tenso
     )
 
 
+def _empty_hydra_head_features(row: dict, num_heads: int) -> None:
+    for head_idx in range(num_heads):
+        prefix = f"head{head_idx + 1}"
+        row[f"{prefix}_top1_token_id"] = ""
+        row[f"{prefix}_top1_prob"] = ""
+        row[f"{prefix}_top5_prob"] = ""
+        row[f"{prefix}_top10_prob"] = ""
+        row[f"{prefix}_prob_gap"] = ""
+        row[f"{prefix}_entropy"] = ""
+        row[f"base_{prefix}_top1_agree"] = ""
+        row[f"base_{prefix}_top5_overlap"] = ""
+        row[f"base_{prefix}_top10_overlap"] = ""
+        row[f"base_{prefix}_top1_prob_delta"] = ""
+        row[f"base_{prefix}_entropy_delta"] = ""
+    row["head1_head2_agree"] = ""
+    row["head1_head2_top5_overlap"] = ""
+    row["head1_head2_top10_overlap"] = ""
+    row["head_confidence_decay"] = ""
+    row["entropy_ratio_h2_h1"] = ""
+    row["head_entropy_delta_h2_h1"] = ""
+
+
+def _hydra_head_logits_for_block_start(model, base_hidden_states: torch.Tensor) -> torch.Tensor | None:
+    """Return [num_heads, vocab] Hydra-head logits for the current block start.
+
+    This mirrors the ungrounded MLP/prefix-MLP proposal path. Grounded and
+    attention heads build logits autoregressively through candidate paths, so a
+    single branch-independent block-start diagnostic is not well-defined there.
+    """
+    hydra_head = model.hydra_head
+    if getattr(hydra_head, "grounded_heads", False):
+        return None
+    if model.hydra_head_arch not in {"mlp", "prefix-mlp"}:
+        return None
+
+    head_logits = []
+    for head_idx in range(model.hydra):
+        hydra_hidden_state = hydra_head.hydra_mlp[head_idx](base_hidden_states)
+        logits = hydra_head.hydra_lm_head[head_idx](hydra_hidden_state)
+        head_logits.append(logits[0, -1].detach())
+    return torch.stack(head_logits, dim=0)
+
+
+def _add_hydra_head_features(
+    row: dict,
+    model,
+    base_logits: torch.Tensor,
+    base_hidden_states: torch.Tensor,
+) -> None:
+    """Log per-Hydra-head top-token and uncertainty summaries for this step."""
+    num_heads = int(model.hydra)
+    _empty_hydra_head_features(row, num_heads)
+    head_logits = _hydra_head_logits_for_block_start(model, base_hidden_states)
+    if head_logits is None:
+        return
+
+    base_logits = base_logits.float()
+    base_top10_vals, base_top10_ids = torch.topk(
+        torch.softmax(base_logits, dim=-1),
+        k=min(10, base_logits.numel()),
+        dim=-1,
+    )
+    base_top1_id = int(base_top10_ids[0].item())
+    base_top1_prob = float(base_top10_vals[0].item())
+    base_entropy = _entropy_from_logits_1d(base_logits)
+    base_top5 = set(base_top10_ids[: min(5, base_top10_ids.numel())].tolist())
+    base_top10 = set(base_top10_ids.tolist())
+
+    top_ids: list[int] = []
+    top_probs: list[float] = []
+    entropies: list[float] = []
+    head_top5_sets: list[set[int]] = []
+    head_top10_sets: list[set[int]] = []
+    for head_idx in range(num_heads):
+        prefix = f"head{head_idx + 1}"
+        logits = head_logits[head_idx].float()
+        _add_distribution_shape_features(row, prefix, logits)
+        probs = torch.softmax(logits, dim=-1)
+        top10_vals, top10_ids = torch.topk(probs, k=min(10, probs.numel()), dim=-1)
+        top_prob, top_id = top10_vals[0], top10_ids[0]
+        entropy = _entropy_from_logits_1d(logits)
+        head_top5 = set(top10_ids[: min(5, top10_ids.numel())].tolist())
+        head_top10 = set(top10_ids.tolist())
+
+        top_ids.append(int(top_id.item()))
+        top_probs.append(float(top_prob.item()))
+        entropies.append(entropy)
+        head_top5_sets.append(head_top5)
+        head_top10_sets.append(head_top10)
+        row[f"{prefix}_top1_token_id"] = top_ids[-1]
+        row[f"{prefix}_top1_prob"] = top_probs[-1]
+        row[f"{prefix}_entropy"] = entropy
+        row[f"base_{prefix}_top1_agree"] = int(base_top1_id == top_ids[-1])
+        row[f"base_{prefix}_top5_overlap"] = len(base_top5 & head_top5) / max(len(base_top5), 1)
+        row[f"base_{prefix}_top10_overlap"] = len(base_top10 & head_top10) / max(len(base_top10), 1)
+        row[f"base_{prefix}_top1_prob_delta"] = base_top1_prob - top_probs[-1]
+        row[f"base_{prefix}_entropy_delta"] = base_entropy - entropy
+
+    if num_heads >= 2:
+        row["head1_head2_agree"] = int(top_ids[0] == top_ids[1])
+        row["head1_head2_top5_overlap"] = (
+            len(head_top5_sets[0] & head_top5_sets[1]) / max(len(head_top5_sets[0]), 1)
+        )
+        row["head1_head2_top10_overlap"] = (
+            len(head_top10_sets[0] & head_top10_sets[1]) / max(len(head_top10_sets[0]), 1)
+        )
+        row["head_confidence_decay"] = top_probs[0] - top_probs[1]
+        row["entropy_ratio_h2_h1"] = entropies[1] / (entropies[0] + 1e-8)
+        row["head_entropy_delta_h2_h1"] = entropies[1] - entropies[0]
+
+
 def _token_semantic_features(tokenizer, token_id: int, input_ids: torch.Tensor) -> dict:
     token_piece = tokenizer.convert_ids_to_tokens(int(token_id))
     token_text = tokenizer.decode([int(token_id)], skip_special_tokens=False)
@@ -362,6 +473,10 @@ def run_hydra_generation_with_logging(
         # One bias-corrected EMA per requested window size. State is per-call,
         # so each conversation starts fresh (no leakage across samples).
         smoothers = {int(w): BiasCorrectedEMA(int(w)) for w in smoothing_windows}
+        accept_smoothers = {4: BiasCorrectedEMA(4), 8: BiasCorrectedEMA(8)}
+        previous_entropy: float | None = None
+        previous_accept_length: int | None = None
+        previous_accept_ema: dict[int, float | str] = {4: "", 8: ""}
         total_generated = 0
         previous_block_hidden: torch.Tensor | None = None
 
@@ -386,6 +501,13 @@ def run_hydra_generation_with_logging(
             step_entropies.append(block_start_entropy)
             block_start_logits = logits[0, -1].detach()
             block_start_hidden = hidden_states[0, -1].detach()
+            hydra_head_features: dict = {}
+            _add_hydra_head_features(
+                hydra_head_features,
+                model,
+                block_start_logits,
+                hidden_states,
+            )
 
             to_pass_input_ids = input_ids if idx == 0 else None
             candidates, tree_candidates = model.hydra_head.proposal(
@@ -425,15 +547,33 @@ def run_hydra_generation_with_logging(
             row.update({
                 "step": idx,
                 "position": int(input_ids.shape[1]),
+                "generated_so_far": int(total_generated),
                 "accept_length": accept_len_int,
                 "tokens_this_step": accept_len_int + 1,
                 "block_start_entropy": block_start_entropy,
+                "block_start_entropy_delta": (
+                    block_start_entropy - previous_entropy
+                    if previous_entropy is not None
+                    else ""
+                ),
+                "prev_accept_length": (
+                    previous_accept_length if previous_accept_length is not None else ""
+                ),
+                "prev_accept_is_one": (
+                    int(previous_accept_length == 1)
+                    if previous_accept_length is not None
+                    else ""
+                ),
+                "prev_accept_ema_w4": previous_accept_ema[4],
+                "prev_accept_ema_w8": previous_accept_ema[8],
             })
             for w in sorted(smoothed_entropies.keys()):
                 row[f"entropy_smoothed_w{w}"] = smoothed_entropies[w]
+                row[f"entropy_minus_smoothed_w{w}"] = block_start_entropy - smoothed_entropies[w]
             row["accepted_text"] = accepted_text.replace("\n", "\\n")
             row.update(_token_semantic_features(tokenizer, accepted_tokens[0], input_ids))
             _add_distribution_shape_features(row, "base", block_start_logits)
+            row.update(hydra_head_features)
             _add_hidden_state_features(row, block_start_hidden, previous_block_hidden)
             row.update(current_layer_features)
             previous_block_hidden = block_start_hidden
@@ -443,6 +583,12 @@ def run_hydra_generation_with_logging(
                     head_acceptance_counts[head_idx] += 1
 
             rows.append(row)
+            previous_entropy = block_start_entropy
+            previous_accept_length = accept_len_int
+            previous_accept_ema = {
+                w: ema.update(float(accept_len_int))
+                for w, ema in accept_smoothers.items()
+            }
             input_ids, logits, hidden_states, total_generated = update_inference_inputs(
                 input_ids,
                 candidates,
