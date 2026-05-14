@@ -220,8 +220,13 @@ logs/sbatch/*
 
 scripts/old_pareto.py
 scripts/slurm/*
-logs/outputs/entropy/*
-logs/outputs/entropy/sharegpt.csv
+entmtp/outputs/entropy/*
+entmtp/outputs/entropy/sharegpt.csv
 
-logs/outputs/pareto_frontier/*.json
-logs/outputs/throughput_frontier/*.json
+entmtp/outputs/pareto_acceptance/*.json
+entmtp/outputs/pareto_throughput/*.json
+entmtp/sbatch/*
+entmtp/outputs/logged_entropy/*.csv
+entmtp/outputs/regime_predictability.ipynb
+entmtp/sbatch
+entmtp/scripts/slurm/*

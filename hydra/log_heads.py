@@ -89,6 +89,13 @@ def _add_distribution_shape_features(row: dict, prefix: str, logits: torch.Tenso
     row[f"{prefix}_prob_gap"] = (
         float((top_vals[0] - top_vals[1]).item()) if k >= 2 else ""
     )
+    for rank in range(10):
+        if rank < k:
+            row[f"{prefix}_top{rank + 1}_token_id"] = int(top_ids[rank].item())
+            row[f"{prefix}_top{rank + 1}_rank_prob"] = float(top_vals[rank].item())
+        else:
+            row[f"{prefix}_top{rank + 1}_token_id"] = ""
+            row[f"{prefix}_top{rank + 1}_rank_prob"] = ""
 
 
 def _empty_hydra_head_features(row: dict, num_heads: int) -> None:
@@ -101,6 +108,9 @@ def _empty_hydra_head_features(row: dict, num_heads: int) -> None:
         row[f"{prefix}_prob_gap"] = ""
         row[f"{prefix}_entropy"] = ""
         row[f"{prefix}_num_paths"] = ""
+        for rank in range(10):
+            row[f"{prefix}_top{rank + 1}_token_id"] = ""
+            row[f"{prefix}_top{rank + 1}_rank_prob"] = ""
         row[f"base_{prefix}_top1_agree"] = ""
         row[f"base_{prefix}_top5_overlap"] = ""
         row[f"base_{prefix}_top10_overlap"] = ""
@@ -112,6 +122,7 @@ def _empty_hydra_head_features(row: dict, num_heads: int) -> None:
     row["head_confidence_decay"] = ""
     row["entropy_ratio_h2_h1"] = ""
     row["head_entropy_delta_h2_h1"] = ""
+    _empty_path_value_features(row, num_heads)
 
 
 def _hydra_head_logits_for_block_start(model, base_hidden_states: torch.Tensor) -> torch.Tensor | None:
@@ -214,6 +225,84 @@ def _add_hydra_head_features(
         row["head_confidence_decay"] = top_probs[0] - top_probs[1]
         row["entropy_ratio_h2_h1"] = entropies[1] / (entropies[0] + 1e-8)
         row["head_entropy_delta_h2_h1"] = entropies[1] - entropies[0]
+
+    _add_path_value_features(row, num_heads, base_top1_prob, head_logits)
+
+
+def _empty_path_value_features(row: dict, num_heads: int) -> None:
+    for depth in range(1, num_heads + 1):
+        row[f"path_value_greedy_depth{depth}"] = ""
+        row[f"path_value_top2_at_depth{depth}"] = ""
+        row[f"path_value_gap_depth{depth}"] = ""
+    row["best_path_value"] = ""
+    row["best_path_value_depth"] = ""
+    row["path_value_log_sum_exp"] = ""
+    row["path_value_entropy_top4"] = ""
+
+
+def _add_path_value_features(
+    row: dict,
+    num_heads: int,
+    base_top1_prob: float,
+    head_logits: torch.Tensor,
+) -> None:
+    """Log EAGLE-2-style path-value diagnostics for the speculative tree.
+
+    The "value" of a path in EAGLE-2 is the product of per-step draft
+    confidences along the path from root to leaf. We approximate that here
+    using the greedy top-1 chain and the single-divergence top-2 alternatives,
+    rooted at the verified base-model top-1 probability.
+    """
+    _empty_path_value_features(row, num_heads)
+    if head_logits is None or num_heads == 0:
+        return
+
+    probs = torch.softmax(head_logits.float(), dim=-1)
+    top_probs = probs.max(dim=-1).values.detach().cpu().tolist()
+    top2_probs = []
+    for head_idx in range(num_heads):
+        if probs.shape[-1] >= 2:
+            top2_probs.append(float(torch.topk(probs[head_idx], k=2, dim=-1).values[1].item()))
+        else:
+            top2_probs.append(0.0)
+
+    greedy_cum = float(base_top1_prob)
+    best_value = greedy_cum
+    best_depth = 0
+    for depth in range(1, num_heads + 1):
+        greedy_cum *= float(top_probs[depth - 1])
+        row[f"path_value_greedy_depth{depth}"] = greedy_cum
+        if greedy_cum > best_value:
+            best_value = greedy_cum
+            best_depth = depth
+
+    # Single-divergence alternative: take top-1 up to depth d-1, then top-2 at depth d.
+    prefix_cum = float(base_top1_prob)
+    for depth in range(1, num_heads + 1):
+        if depth >= 2:
+            prefix_cum *= float(top_probs[depth - 2])
+        alt = prefix_cum * float(top2_probs[depth - 1])
+        row[f"path_value_top2_at_depth{depth}"] = alt
+        greedy_at_d = float(row[f"path_value_greedy_depth{depth}"])
+        row[f"path_value_gap_depth{depth}"] = greedy_at_d - alt
+
+    row["best_path_value"] = best_value
+    row["best_path_value_depth"] = best_depth
+
+    # Aggregate over the greedy chain + first sibling per depth so we can summarise
+    # how concentrated path probability mass is at this step.
+    path_values: list[float] = []
+    for depth in range(1, num_heads + 1):
+        path_values.append(float(row[f"path_value_greedy_depth{depth}"]))
+        path_values.append(float(row[f"path_value_top2_at_depth{depth}"]))
+    if path_values:
+        arr = torch.tensor(path_values, dtype=torch.float64)
+        log_sum_exp = torch.logsumexp(torch.log(arr.clamp_min(1e-12)), dim=0)
+        row["path_value_log_sum_exp"] = float(log_sum_exp.item())
+        top4 = torch.topk(arr, k=min(4, arr.numel())).values
+        normaliser = top4.sum().clamp_min(1e-12)
+        p = top4 / normaliser
+        row["path_value_entropy_top4"] = float(-(p * torch.log(p.clamp_min(1e-12))).sum().item())
 
 
 def _token_semantic_features(tokenizer, token_id: int, input_ids: torch.Tensor) -> dict:
