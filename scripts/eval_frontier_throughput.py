@@ -6,7 +6,7 @@ but not sufficient: Hydra's paper selects the final tree by measuring
 end-to-end throughput, because topology shape changes per-step cost.
 
 This script performs that second stage. It takes a `greedy_*_self.json`, runs
-every frontier tree in `all_results` plus the published `mc_sim_7b_63` topology
+selected rows from `all_results` plus the published `mc_sim_7b_63` topology
 on the same prompt basket, and records:
 
   * output_tokens_per_second: generated continuation tokens / timed seconds
@@ -433,35 +433,48 @@ def plot_results(payload: Dict, out_plot: Path) -> None:
     rows = [r for r in payload["all_results"] if not r.get("is_published_default")]
     if not rows:
         return
-    fig, ax = plt.subplots(figsize=(9, 6))
+    fig, ax = plt.subplots(figsize=(10, 6))
     by_depth: Dict[int, List[Dict]] = {}
     for row in rows:
         by_depth.setdefault(row["depth"], []).append(row)
-    for depth, rs in sorted(by_depth.items()):
+
+    cmap = plt.cm.tab10
+    for i, (depth, rs) in enumerate(sorted(by_depth.items())):
+        color = cmap(i % 10)
         ax.scatter(
             [r["n_nodes"] for r in rs],
             [r["output_tokens_per_second"] for r in rs],
             s=48,
-            alpha=0.8,
+            alpha=0.85,
+            color=color,
+            edgecolors="black",
+            linewidths=0.35,
             label=f"depth={depth} (n={len(rs)})",
+            zorder=3,
         )
-    front = throughput_frontier(rows)
+        front_d = throughput_frontier(rs)
+        if len(front_d) >= 2:
+            ax.plot(
+                [r["n_nodes"] for r in front_d],
+                [r["output_tokens_per_second"] for r in front_d],
+                linestyle="--",
+                linewidth=2.0,
+                color=color,
+                alpha=0.95,
+                label=f"depth={depth} tok/s frontier (n={len(front_d)})",
+                zorder=4,
+            )
+
+    front_all = throughput_frontier(rows)
     ax.plot(
-        [r["n_nodes"] for r in front],
-        [r["output_tokens_per_second"] for r in front],
-        "k--",
-        linewidth=2,
-        label=f"throughput frontier (n={len(front)})",
-    )
-    ax.scatter(
-        [r["n_nodes"] for r in front],
-        [r["output_tokens_per_second"] for r in front],
-        color="red",
-        marker="*",
-        s=110,
-        edgecolor="black",
-        linewidth=0.7,
-        zorder=5,
+        [r["n_nodes"] for r in front_all],
+        [r["output_tokens_per_second"] for r in front_all],
+        color="0.35",
+        linestyle="-.",
+        linewidth=1.6,
+        alpha=0.75,
+        zorder=2,
+        label=f"global tok/s hull, all depths (n={len(front_all)})",
     )
     pd = payload.get("published_default")
     if pd is not None:
@@ -487,11 +500,14 @@ def plot_results(payload: Dict, out_plot: Path) -> None:
         )
     ax.set_xlabel("Number of tree nodes")
     ax.set_ylabel("Output tokens per second")
+    mode = payload.get("candidate_mode", "?")
+    ds = payload.get("dataset") or Path(payload.get("data_path", "")).name
     ax.set_title(
-        f"Hydra stage-two throughput selection | {Path(payload['data_path']).name}"
+        f"Hydra throughput vs tree size | {ds}\n"
+        f"candidate_mode={mode} | colored dashed = per-depth tok/s frontier"
     )
     ax.grid(True, alpha=0.3)
-    ax.legend(loc="best", fontsize=9)
+    ax.legend(loc="best", fontsize=8, ncol=2)
     fig.tight_layout()
     out_plot.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_plot, dpi=150, bbox_inches="tight")
@@ -529,6 +545,13 @@ def main(args) -> None:
     out_path = Path(args.out_json)
     if out_path.exists() and args.resume:
         payload = json.loads(out_path.read_text())
+        prev_mode = payload.get("candidate_mode")
+        if prev_mode is not None and prev_mode != args.candidate_mode:
+            raise SystemExit(
+                f"Refusing resume: {out_path} has candidate_mode={prev_mode!r} "
+                f"but you requested {args.candidate_mode!r}. Indices in candidate_id "
+                f"depend on selection order—use a new --out-json or --no-resume."
+            )
         done = already_done(payload)
         print(f"[resume] loaded {out_path}; {len(done)} candidates already done")
     else:
@@ -536,6 +559,7 @@ def main(args) -> None:
             "method": "frontier_throughput",
             "source_self_json": args.self_json,
             "data_path": args.data_path,
+            "dataset": args.dataset or Path(args.data_path).name,
             "seed": args.seed,
             "n_prompts": len(prompts),
             "max_new_tokens": args.max_new_tokens,
@@ -563,8 +587,9 @@ def main(args) -> None:
 
     pending = [c for c in candidates if c["candidate_id"] not in done]
     print(
-        f"Throughput eval: {len(candidates)} candidates total, "
-        f"{len(pending)} pending, {len(prompts)} prompts"
+        f"Throughput eval: candidate_mode={args.candidate_mode!r} | "
+        f"{len(candidates)} candidates total, {len(pending)} pending, "
+        f"{len(prompts)} prompts"
     )
 
     for i, candidate in enumerate(pending, start=1):
@@ -618,6 +643,11 @@ def parse_args():
     p.add_argument("--hydra-checkpoint", default="ankner/hydra-vicuna-7b-v1.3")
     p.add_argument("--base-model", default="lmsys/vicuna-7b-v1.3")
     p.add_argument("--self-json", required=True)
+    p.add_argument(
+        "--dataset",
+        default=None,
+        help="Short label stored in JSON and plot title (default: basename of --data-path).",
+    )
     p.add_argument("--data-path", required=True)
     p.add_argument("--out-json", required=True)
     p.add_argument("--out-plot", default="")
@@ -636,10 +666,14 @@ def parse_args():
     p.add_argument(
         "--candidate-mode",
         choices=["all", "global-frontier", "per-depth-frontier"],
-        default="all",
+        default="per-depth-frontier",
         help=(
-            "Which rows to throughput-evaluate from --self-json. Use "
-            "`per-depth-frontier` to ensure each depth has its own frontier."
+            "Which rows from --self-json to evaluate. "
+            "`per-depth-frontier`: union of mean_accept Pareto-optimal trees "
+            "within each depth (full greedy frontier per depth on throughput plot). "
+            "`global-frontier`: single mean_accept Pareto curve over all depths "
+            "(often collapses shallow depths to one point each). "
+            "`all`: every row in all_results."
         ),
     )
     return p.parse_args()
