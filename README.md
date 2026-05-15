@@ -2,7 +2,6 @@
 <h1 align="center">
   Entmtp: accelerating LLM inference with entropy-aware multi-token-prediction 
 </h1>
----
 
 ## Introduction
 Our codebase is forked from the [Hydra](https://github.com/zankner/Hydra) codebase. If you find this work interesting you should check out their method!
@@ -11,7 +10,7 @@ Medusa introduces multiple lightweight draft heads on top of the frozen base LLM
 
 Hydra improves upon Medusa by leveraging sequentially dependent draft heads that are aware of earlier tokens in the candidate continuation. This simple design change significantly improves the prediction quality of the heads, thus improving the overall decoding efficiency. We study these Hydra heads and alternate draft head architectures over a range of Vicuna models in the batch size 1 regime, achieving 2.5-2.7x improvements in throughput over baseline and 1.3x improvement in throughput over Medusa.
 
-Entmtp builds on both lines of work and adds entropy-aware scheduling for Hydra decoding plus tooling to search, debias, and score custom greedy draft-tree topologies (beyond the default `mc_sim_7b_63` choice).
+Entmtp builds on both lines of work and adds entropy-aware scheduling for Hydra decoding plus tooling to search, debias, and score custom greedy draft-tree topologies (beyond the default `mc_sim_7b_63` choice) for task-specific .
 
 ## Table of Contents
 - [Introduction](#introduction)

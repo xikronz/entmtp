@@ -400,22 +400,11 @@ def pack_candidate_batches(candidates_metadata: List[Dict], max_union_paths: int
 
     return batches
 
-
-# ---------------------------------------------------------------------------
-# Path-position bookkeeping for the superset
-# ---------------------------------------------------------------------------
-
 def build_path_to_pos(hydra_choices: List[List[int]]) -> Dict[Tuple[int, ...], int]:
     out = {(): 0}
     for i, p in enumerate(sorted(hydra_choices, key=lambda x: (len(x), x))):
         out[tuple(p)] = i + 1
     return out
-
-
-# ---------------------------------------------------------------------------
-# Per-step accept-length under typical acceptance, for an arbitrary sub-tree
-# (cached parent-distribution computations across candidates)
-# ---------------------------------------------------------------------------
 
 def compute_step_accepts_for_all_candidates(
     candidates_metadata: List[Dict],

@@ -216,7 +216,7 @@ Temporary Items
 .vscode/
 
 #logs
-logs/sbatch/*
+logs/*
 
 scripts/old_pareto.py
 scripts/slurm/*
