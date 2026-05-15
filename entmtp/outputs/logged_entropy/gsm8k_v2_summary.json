@@ -8,7 +8,7 @@
     "max_samples": null,
     "smoothing_windows": "4,8,12,16,24,32,64",
     "max_new_tokens": 512,
-    "output": "logs/outputs/entropy/gsm8k_v2.csv",
+    "output": "entmtp/outputs/logged_entropy/gsm8k_v2.csv",
     "mode": "generation",
     "temperature": 0.0,
     "posterior_threshold": 0.09,
