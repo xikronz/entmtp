@@ -158,6 +158,10 @@ def run_vanilla(
 
     out = model.base_model(input_ids, past_key_values=past_kv)
     logits = out.logits[0, -1]
+    if exclude_prefill:
+        _cuda_sync()
+        t0 = time.perf_counter()
+
     generated = input_ids
     new_tokens = 0
 
@@ -205,6 +209,7 @@ def run_static_tree(
     max_input_tokens: int,
     new_token_cap: int,
     cached_buffers: Optional[Dict[str, torch.Tensor]] = None,
+    exclude_prefill: bool = False,
 ) -> Dict[str, Any]:
     """Hydra speculative decoding with a fixed draft-tree topology."""
     input_ids = tok(prompt_text, return_tensors="pt").input_ids.to(device)
@@ -233,6 +238,9 @@ def run_static_tree(
         past_kv,
         buffers["proposal_cross_attn_masks"],
     )
+    if exclude_prefill:
+        _cuda_sync()
+        t0 = time.perf_counter()
 
     new_token = 0
     n_steps = 0
@@ -310,6 +318,7 @@ def run_scheduled(
     device: torch.device,
     max_input_tokens: int,
     new_token_cap: int,
+    exclude_prefill: bool = False,
 ) -> Dict[str, Any]:
     """Hydra speculative decoding with per-step tree switching.
 
@@ -342,6 +351,9 @@ def run_scheduled(
         past_kv,
         largest["proposal_cross_attn_masks"],
     )
+    if exclude_prefill:
+        _cuda_sync()
+        t0 = time.perf_counter()
 
     selections: List[int] = []
     accept_lengths: List[int] = []
@@ -546,6 +558,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--temperature", type=float, default=0.7)
     p.add_argument("--posterior-threshold", type=float, default=0.09)
     p.add_argument("--posterior-alpha", type=float, default=0.3)
+    p.add_argument(
+        "--exclude-prefill",
+        action="store_true",
+        help=(
+            "Start the perf timer after initialize_hydra (Hydra) or after the "
+            "first base forward (vanilla), matching entmtp/scripts/pareto_throughput.py "
+            "with --exclude-prefill and frontier JSON include_prefill=false."
+        ),
+    )
 
     p.add_argument("--hydra-checkpoint", default="ankner/hydra-vicuna-7b-v1.3")
     p.add_argument("--base-model", default="lmsys/vicuna-7b-v1.3")
@@ -622,7 +643,8 @@ def main() -> None:
     print(
         f"data_path={args.data_path}  n_prompts={len(prompts)}  "
         f"max_new_tokens={args.max_new_tokens}  "
-        f"tau={args.temperature} eps={args.posterior_threshold} alpha={args.posterior_alpha}"
+        f"tau={args.temperature} eps={args.posterior_threshold} alpha={args.posterior_alpha}  "
+        f"exclude_prefill={args.exclude_prefill}"
     )
 
     results: Dict[str, Dict[str, Any]] = {}
@@ -692,6 +714,7 @@ def main() -> None:
                     hydra_model, tok, text,
                     args.max_new_tokens, args.temperature,
                     device, args.max_input_tokens,
+                    exclude_prefill=args.exclude_prefill,
                 ),
             )
         if not args.skip_hydra:
@@ -704,6 +727,7 @@ def main() -> None:
                     args.posterior_threshold, args.posterior_alpha,
                     device, args.max_input_tokens, args.new_token_cap,
                     cached_buffers=default_buffers,
+                    exclude_prefill=args.exclude_prefill,
                 ),
             )
         if not args.skip_entmtp_static:
@@ -716,6 +740,7 @@ def main() -> None:
                     args.posterior_threshold, args.posterior_alpha,
                     device, args.max_input_tokens, args.new_token_cap,
                     cached_buffers=static_buffers,
+                    exclude_prefill=args.exclude_prefill,
                 ),
             )
         if not args.skip_entmtp_scheduled:
@@ -726,6 +751,7 @@ def main() -> None:
                     args.max_new_tokens, args.temperature,
                     args.posterior_threshold, args.posterior_alpha,
                     device, args.max_input_tokens, args.new_token_cap,
+                    exclude_prefill=args.exclude_prefill,
                 ),
             )
 
@@ -752,6 +778,7 @@ def main() -> None:
                         args.posterior_threshold, args.posterior_alpha,
                         device, args.max_input_tokens, args.new_token_cap,
                         cached_buffers=default_buffers,
+                        exclude_prefill=args.exclude_prefill,
                     )
                 except Exception as exc:  # noqa: BLE001
                     row = {"error": str(exc)}
