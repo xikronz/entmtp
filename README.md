@@ -18,8 +18,6 @@ Hydra improves upon Medusa by leveraging sequentially dependent draft heads that
 Entmtp builds on both lines of work and adds entropy-aware scheduling for Hydra decoding plus tooling to search, debias, and score custom greedy draft-tree topologies (beyond the default `mc_sim_7b_63` choice) for task-specific workflows across Coding, Conversational AI, and Mathematics.
 
 <img width="2315" height="761" alt="Screenshot from 2026-06-20 01-29-05" src="https://github.com/user-attachments/assets/904a1b98-4adc-416c-9e93-f3513ef5101b" />
-<img width="2357" height="816" alt="Screenshot from 2026-05-16 00-21-32" src="https://github.com/user-attachments/assets/25feca64-bc20-414f-9688-e3bbc4236a25" />
-<img width="2342" height="776" alt="Screenshot from 2026-05-15 19-34-51" src="https://github.com/user-attachments/assets/22192060-bc6e-4470-985c-5053e8ad2f76" />
 
 ## Table of Contents
 - [Introduction](#introduction)
