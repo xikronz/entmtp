@@ -3,7 +3,7 @@
   Entmtp: accelerating LLM inference with entropy-aware multi-token-prediction 
 </h1>
 <p align="center">
-| <a href="[https://arxiv.org/abs/2402.05109](http://arxiv.org/abs/2606.27550)"><b>Paper</b></a> |
+|<a href="https://arxiv.org/abs/2402.05109"><b>Paper</b></a> |
 </p>
 
 ---
