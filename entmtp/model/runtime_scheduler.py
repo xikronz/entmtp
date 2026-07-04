@@ -11,6 +11,7 @@ rebuilding any tensors per step.
 """
 from __future__ import annotations
 
+import bisect
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -363,17 +364,78 @@ def compute_path_value_features(
     )
 
 
+def _last_base_logits(base_logits: torch.Tensor) -> torch.Tensor:
+    if base_logits.dim() >= 3:
+        return base_logits[0, -1]
+    if base_logits.dim() == 2:
+        return base_logits[-1]
+    return base_logits
+
+
+def _last_head_logits(head_logits: torch.Tensor) -> torch.Tensor:
+    if head_logits.dim() == 2:
+        return head_logits
+    if head_logits.dim() == 3:
+        return head_logits[:, -1]
+    if head_logits.dim() == 4:
+        return head_logits[:, 0, -1]
+    raise ValueError(f"head_logits must have 2-4 dims, got {head_logits.dim()}")
+
+
+@torch.inference_mode()
+def compute_fast_path_score(
+    base_logits: torch.Tensor,
+    head_logits: Optional[torch.Tensor] = None,
+    score_feature: str = "best_path_value",
+) -> float:
+    """Score-only path-value computation for the decode-loop hot path.
+
+    This avoids materialising full softmax tensors and avoids multiple
+    GPU->CPU synchronisations from ``.tolist()``. It returns exactly the scalar
+    needed by ``threshold_ladder`` / ``binary_tau`` for these score features:
+    ``best_path_value``, ``base_top1_prob``, and
+    ``path_value_greedy_depth{1..4}``. A single ``.item()`` sync happens at the
+    end.
+
+    ``best_depth`` still needs the full ``PathValueFeatures`` object because it
+    selects from ``best_path_value_depth``.
+    """
+    base_last = _last_base_logits(base_logits).float()
+    base_top1 = torch.exp(base_last.max() - torch.logsumexp(base_last, dim=-1))
+
+    if score_feature == "base_top1_prob" or head_logits is None:
+        return float(base_top1.item())
+
+    head_last = _last_head_logits(head_logits).float()
+    head_top1_logits = head_last.max(dim=-1).values
+    head_top1 = torch.exp(head_top1_logits - torch.logsumexp(head_last, dim=-1))
+    greedy = base_top1 * torch.cumprod(head_top1, dim=0)
+
+    if score_feature.startswith("path_value_greedy_depth"):
+        depth = int(score_feature.split("depth")[-1])
+        if 1 <= depth <= int(greedy.numel()):
+            return float(greedy[depth - 1].item())
+        return float(base_top1.item())
+
+    if score_feature == "best_path_value":
+        return float(torch.maximum(base_top1, greedy.max()).item())
+
+    raise ValueError(f"unknown score_feature for fast path: {score_feature!r}")
+
+
 @dataclass(frozen=True)
 class TreeAction:
     """Output of :meth:`EagleTreeSelector.select`.
 
     ``index`` is the integer to look up in the bank; ``candidate_id`` is the
-    same tree's frontier name for logging.
+    same tree's frontier name for logging. ``features`` is optional so the
+    hot path can use a score-only selector without constructing the full
+    Python feature object every decode step.
     """
 
     index: int
     candidate_id: str
-    features: PathValueFeatures
+    features: Optional[PathValueFeatures]
     score: float
 
 
@@ -416,6 +478,9 @@ class EagleTreeSelector:
         tau: float = 0.0,
         binary_conservative_id: str = "frontier_0001_n3_d3",
         binary_aggressive_id: str = "frontier_0024_n28_d4",
+        tau_on: Optional[float] = None,
+        tau_off: Optional[float] = None,
+        policy_period: int = 1,
     ) -> None:
         if mode not in {"threshold_ladder", "best_depth", "binary_tau"}:
             raise ValueError(
@@ -438,8 +503,15 @@ class EagleTreeSelector:
         self.mode = mode
         self.score_feature = score_feature
         self.tau = float(tau)
+        self.tau_on = float(tau if tau_on is None else tau_on)
+        self.tau_off = float(tau if tau_off is None else tau_off)
+        if self.tau_off > self.tau_on:
+            raise ValueError("EagleTreeSelector: tau_off must be <= tau_on")
+        self.policy_period = max(1, int(policy_period))
         self.binary_conservative_id = str(binary_conservative_id)
         self.binary_aggressive_id = str(binary_aggressive_id)
+        self._current_index = 0
+        self._last_score = float("nan")
 
         if mode == "threshold_ladder":
             self._thresholds = self._build_thresholds(thresholds, len(bank))
@@ -459,6 +531,7 @@ class EagleTreeSelector:
                     f"(conservative={self.binary_conservative_id!r}, "
                     f"aggressive={self.binary_aggressive_id!r})"
                 ) from exc
+            self._current_index = self._idx_small
         else:
             self._idx_small = -1
             self._idx_big = -1
@@ -484,10 +557,11 @@ class EagleTreeSelector:
 
     @staticmethod
     def _build_depth_table(bank: TopologyBank) -> Dict[int, int]:
+        metas = bank.metas
         table: Dict[int, int] = {}
-        for i, meta in enumerate(bank.metas):
+        for i, meta in enumerate(metas):
             cur = table.get(meta.depth)
-            if cur is None or bank.metas[cur].n_nodes < meta.n_nodes:
+            if cur is None or metas[cur].n_nodes < meta.n_nodes:
                 table[meta.depth] = i
         return table
 
@@ -501,18 +575,26 @@ class EagleTreeSelector:
             return features.path_value_greedy[depth - 1]
         return features.best_path_value
 
+    def _pick_binary_tau_score(self, score: float) -> int:
+        # Hysteresis: switch up at tau_on, switch down at tau_off. When
+        # tau_on == tau_off this reduces to the original binary threshold.
+        if self._current_index == self._idx_big:
+            if score <= self.tau_off:
+                self._current_index = self._idx_small
+        elif score > self.tau_on:
+            self._current_index = self._idx_big
+        else:
+            self._current_index = self._idx_small
+        return self._current_index
+
     def _pick_binary_tau(self, features: PathValueFeatures) -> int:
-        score = self._read_score(features)
-        if score > self.tau:
-            return self._idx_big
-        return self._idx_small
+        return self._pick_binary_tau_score(self._read_score(features))
+
+    def _pick_threshold_ladder_score(self, score: float) -> int:
+        return min(bisect.bisect_right(self._thresholds, score), len(self.bank) - 1)
 
     def _pick_threshold_ladder(self, features: PathValueFeatures) -> int:
-        score = self._read_score(features)
-        for i, t in enumerate(self._thresholds):
-            if score < t:
-                return i
-        return len(self.bank) - 1
+        return self._pick_threshold_ladder_score(self._read_score(features))
 
     def _pick_best_depth(self, features: PathValueFeatures) -> int:
         d = features.best_path_value_depth
@@ -525,6 +607,91 @@ class EagleTreeSelector:
         if lower:
             return self._depth_to_index[lower[-1]]
         return self._depth_to_index[available[0]]
+
+    def select_index_from_score(self, score: float) -> int:
+        """Return only the bank index from a scalar score.
+
+        This is the lowest-overhead API for the decode loop. It skips
+        ``PathValueFeatures`` construction, ``TreeAction`` allocation, and
+        metadata lookup. Use with :func:`compute_fast_path_score` when possible.
+        """
+        self._last_score = float(score)
+        if self.mode == "threshold_ladder":
+            idx = self._pick_threshold_ladder_score(float(score))
+        elif self.mode == "binary_tau":
+            idx = self._pick_binary_tau_score(float(score))
+        else:
+            raise ValueError(
+                "select_index_from_score only supports threshold_ladder and "
+                "binary_tau; use select(features=...) for best_depth"
+            )
+        self._current_index = idx
+        return idx
+
+    def select_from_score(self, score: float) -> TreeAction:
+        """Return a lightweight ``TreeAction`` from a scalar score."""
+        idx = self.select_index_from_score(score)
+        return TreeAction(
+            index=idx,
+            candidate_id=self.bank.get_meta(idx).candidate_id,
+            features=None,
+            score=float(score),
+        )
+
+    def select_fast(
+        self,
+        base_logits: torch.Tensor,
+        head_logits: Optional[torch.Tensor] = None,
+        *,
+        step: Optional[int] = None,
+        force_update: bool = False,
+        return_action: bool = True,
+    ) -> Union[int, TreeAction]:
+        """Fast score-only selection for online decoding.
+
+        ``policy_period`` is applied when ``step`` is provided: on skipped
+        steps, the previous index is reused with no logit reductions. Set
+        ``return_action=False`` for the absolute hot path, where the caller
+        only needs ``bank[idx]``.
+        """
+        if (
+            not force_update
+            and step is not None
+            and step > 0
+            and step % self.policy_period != 0
+        ):
+            idx = self._current_index
+            if return_action:
+                return TreeAction(
+                    index=idx,
+                    candidate_id=self.bank.get_meta(idx).candidate_id,
+                    features=None,
+                    score=self._last_score,
+                )
+            return idx
+
+        if self.mode == "best_depth":
+            # best_depth relies on argmax depth, so preserve the slower but
+            # semantically exact feature path.
+            action = self.select(base_logits=base_logits, head_logits=head_logits)
+            return action if return_action else action.index
+
+        score = compute_fast_path_score(
+            base_logits, head_logits, score_feature=self.score_feature
+        )
+        idx = self.select_index_from_score(score)
+        if return_action:
+            return TreeAction(
+                index=idx,
+                candidate_id=self.bank.get_meta(idx).candidate_id,
+                features=None,
+                score=score,
+            )
+        return idx
+
+    def buffers_for_index(self, index: int) -> Dict[str, torch.Tensor]:
+        """Lowest-overhead buffer lookup when the hot path already has an index."""
+        return self.bank[index]
 
     def select(
         self,
@@ -553,11 +720,14 @@ class EagleTreeSelector:
         else:
             idx = self._pick_binary_tau(features)
 
+        score = self._read_score(features)
+        self._current_index = idx
+        self._last_score = score
         return TreeAction(
             index=idx,
             candidate_id=self.bank.get_meta(idx).candidate_id,
             features=features,
-            score=self._read_score(features),
+            score=score,
         )
 
     def buffers_for(self, action: TreeAction) -> Dict[str, torch.Tensor]:

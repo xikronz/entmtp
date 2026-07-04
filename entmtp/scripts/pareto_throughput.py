@@ -18,6 +18,10 @@ update_inference_inputs loop as Hydra's generation code. By default, prompt
 prefill is included in the timed region, matching the practical end-to-end
 generation cost for each prompt. Use `--exclude-prefill` to time only the
 decode loop after `initialize_hydra`.
+
+Optional ``--data-preset`` selects a built-in prompt file under the Hydra repo
+(``alpaca``, ``sharegpt``, ``humaneval``, ``gsm``, ``litbench``); it overrides
+``--data-path`` when set (LitBench: ``data/litbench/litbench_train.json``).
 """
 from __future__ import annotations
 
@@ -56,6 +60,15 @@ from hydra.model.utils import (  # noqa: E402
     update_inference_inputs,
 )
 from scripts.pareto_experiment import enumerate_paths, load_sharegpt_prompts  # noqa: E402
+
+# Repo-relative prompt files for ``--data-preset`` (paths joined with ``HYDRA_REPO``).
+_DATA_PRESETS: Dict[str, str] = {
+    "alpaca": "data/alpaca/train.jsonl",
+    "sharegpt": "data/sharegpt/raw/train.json",
+    "humaneval": "data/humaneval/humaneval_val.json",
+    "gsm": "data/gsm8k/val.jsonl",
+    "litbench": "data/litbench/litbench_train.json",
+}
 
 
 def release_hydra_decode_state(model: HydraModel) -> None:
@@ -529,6 +542,17 @@ def main(args) -> None:
     if not torch.cuda.is_available():
         raise SystemExit("CUDA is required for throughput timing.")
 
+    if args.data_preset:
+        preset_path = Path(HYDRA_REPO) / _DATA_PRESETS[args.data_preset]
+        if args.data_path:
+            print(
+                f"[warn] --data-preset={args.data_preset!r} overrides "
+                f"--data-path={args.data_path!r}"
+            )
+        args.data_path = str(preset_path.resolve())
+    if not args.data_path:
+        raise SystemExit("Pass --data-path or --data-preset.")
+
     self_data = json.loads(Path(args.self_json).read_text())
     candidates = make_frontier_candidates(self_data, args.candidate_mode)
     if not args.skip_default:
@@ -559,7 +583,8 @@ def main(args) -> None:
             "method": "frontier_throughput",
             "source_self_json": args.self_json,
             "data_path": args.data_path,
-            "dataset": args.dataset or Path(args.data_path).name,
+            "dataset": args.dataset or args.data_preset or Path(args.data_path).name,
+            "data_preset": args.data_preset,
             "seed": args.seed,
             "n_prompts": len(prompts),
             "max_new_tokens": args.max_new_tokens,
@@ -648,7 +673,20 @@ def parse_args():
         default=None,
         help="Short label stored in JSON and plot title (default: basename of --data-path).",
     )
-    p.add_argument("--data-path", required=True)
+    p.add_argument(
+        "--data-preset",
+        default=None,
+        choices=sorted(_DATA_PRESETS.keys()),
+        help=(
+            "Use a built-in repo-relative prompt file (under HYDRA_REPO); "
+            "overrides --data-path when set."
+        ),
+    )
+    p.add_argument(
+        "--data-path",
+        default=None,
+        help="JSON/JSONL prompt file (required unless --data-preset is set).",
+    )
     p.add_argument("--out-json", required=True)
     p.add_argument("--out-plot", default="")
     p.add_argument("--n-prompts", type=int, default=100)

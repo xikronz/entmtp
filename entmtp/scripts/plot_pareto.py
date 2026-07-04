@@ -1,10 +1,14 @@
 """Visualize the Pareto frontier of draft-tree shapes from pareto_experiment.py.
 
-Reads `pareto_results.json` and produces:
-  1. Scatter of all candidate trees in (n_nodes, mean_accept) space, colored by depth.
-  2. Overall Pareto frontier (best mean_accept at each node count, any depth).
-  3. Per-depth Pareto frontiers (separate curve for each depth).
-  4. Labels for the per-cell budget-target winners.
+Reads JSON with either:
+
+  * **Self-rollout / greedy sweep** — ``mean_accept``, ``per_cell_winners``, etc.
+    (original ``pareto_experiment`` outputs).
+
+  * **Throughput frontier** — ``method: frontier_throughput`` and
+    ``output_tokens_per_second`` per row (e.g. ``greedy_*_throughput.json`` from
+    ``pareto_throughput.py``). Produces tok/s vs ``n_nodes`` with the same hull
+    styling as that script's plot.
 """
 from __future__ import annotations
 
@@ -41,17 +45,150 @@ def pareto_frontier(points: List[Tuple[int, float]]) -> List[Tuple[int, float]]:
     return out
 
 
+def throughput_frontier_rows(rows: List[Dict]) -> List[Dict]:
+    """Pareto hull on (n_nodes ↑, output_tokens_per_second ↑), same as pareto_throughput."""
+    usable = [r for r in rows if r.get("output_tokens_per_second") is not None]
+    pts = sorted(
+        usable,
+        key=lambda r: (int(r["n_nodes"]), -float(r["output_tokens_per_second"])),
+    )
+    out: List[Dict] = []
+    best = -float("inf")
+    for row in pts:
+        score = float(row["output_tokens_per_second"])
+        if score > best + 1e-9:
+            out.append(row)
+            best = score
+    return out
+
+
+def plot_throughput_frontier(data: Dict, out_path: Path) -> None:
+    """Single-panel tok/s vs n_nodes (throughput JSON from pareto_throughput.py)."""
+    rows = [r for r in data.get("all_results", []) if not r.get("is_published_default")]
+    if not rows:
+        raise ValueError("throughput plot: no rows in all_results")
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    by_depth: Dict[int, List[Dict]] = {}
+    for row in rows:
+        by_depth.setdefault(int(row["depth"]), []).append(row)
+
+    cmap = plt.get_cmap("tab10")
+    for i, (depth, rs) in enumerate(sorted(by_depth.items())):
+        color = cmap(i % 10)
+        ax.scatter(
+            [r["n_nodes"] for r in rs],
+            [float(r["output_tokens_per_second"]) for r in rs],
+            s=48,
+            alpha=0.85,
+            color=color,
+            edgecolors="black",
+            linewidths=0.35,
+            label=f"depth={depth} (n={len(rs)})",
+            zorder=3,
+        )
+        front_d = throughput_frontier_rows(rs)
+        if len(front_d) >= 2:
+            ax.plot(
+                [r["n_nodes"] for r in front_d],
+                [float(r["output_tokens_per_second"]) for r in front_d],
+                linestyle="--",
+                linewidth=2.0,
+                color=color,
+                alpha=0.95,
+                label=f"depth={depth} tok/s frontier (n={len(front_d)})",
+                zorder=4,
+            )
+
+    front_all = throughput_frontier_rows(rows)
+    ax.plot(
+        [r["n_nodes"] for r in front_all],
+        [float(r["output_tokens_per_second"]) for r in front_all],
+        color="0.35",
+        linestyle="-.",
+        linewidth=1.6,
+        alpha=0.75,
+        zorder=2,
+        label=f"global tok/s hull, all depths (n={len(front_all)})",
+    )
+    pd = data.get("published_default")
+    if pd is not None and pd.get("output_tokens_per_second") is not None:
+        ax.scatter(
+            [pd["n_nodes"]],
+            [float(pd["output_tokens_per_second"])],
+            color="gold",
+            marker="*",
+            s=360,
+            edgecolor="black",
+            linewidth=1.4,
+            zorder=6,
+            label="mc_sim_7b_63",
+        )
+        ax.annotate(
+            f"mc_sim_7b_63\n{float(pd['output_tokens_per_second']):.1f} tok/s",
+            (pd["n_nodes"], float(pd["output_tokens_per_second"])),
+            xytext=(8, -12),
+            textcoords="offset points",
+            fontsize=9,
+            color="darkgoldenrod",
+            fontweight="bold",
+        )
+    ax.set_xlabel("Number of tree nodes")
+    ax.set_ylabel("Output tokens per second")
+    mode = data.get("candidate_mode", "?")
+    ds = data.get("dataset") or Path(str(data.get("data_path", ""))).name
+    ax.set_title(
+        f"Hydra throughput vs tree size | {ds}\n"
+        f"candidate_mode={mode} | dashed = per-depth tok/s frontier"
+    )
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc="best", fontsize=8, ncol=2)
+    fig.tight_layout()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    print(f"[ok] saved {out_path}")
+
+    print("\nGlobal throughput Pareto frontier (sweep candidates only):")
+    print(f"  {'nodes':>6s}  {'tok/s':>10s}  {'depth':>5s}  candidate_id")
+    for r in front_all:
+        print(
+            f"  {int(r['n_nodes']):>6d}  "
+            f"{float(r['output_tokens_per_second']):>10.2f}  "
+            f"{int(r['depth']):>5d}  {r.get('candidate_id', '')}"
+        )
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--in_json", default="logs/outputs/greedy_tree_359119.json")
-    ap.add_argument("--out", default="logs/outputs/greedy_litbench.png")
+    ap.add_argument(
+        "--out",
+        default="",
+        help="Output PNG (default: <in_json stem>_pareto.png next to the JSON).",
+    )
     ap.add_argument("--annotate_winners", action="store_true", default=True,
                     help="Label each per-cell budget winner with its width tuple.")
     ap.add_argument("--max_label_n", type=int, default=20,
                     help="Skip annotation labels beyond this many points to avoid clutter.")
     args = ap.parse_args()
 
-    data = json.loads(Path(args.in_json).read_text())
+    in_path = Path(args.in_json)
+    data = json.loads(in_path.read_text())
+
+    out_path = Path(args.out) if args.out else in_path.with_name(
+        in_path.stem + "_pareto.png"
+    )
+
+    if data.get("method") == "frontier_throughput" or (
+        isinstance(data.get("all_results"), list)
+        and data["all_results"]
+        and isinstance(data["all_results"][0], dict)
+        and "output_tokens_per_second" in data["all_results"][0]
+        and "mean_accept" not in data["all_results"][0]
+    ):
+        plot_throughput_frontier(data, out_path)
+        return
+
     if "all_results" in data:
         rows = data["all_results"]
     elif "per_depth_history" in data:
@@ -181,7 +318,6 @@ def main():
 
     fig.tight_layout(rect=[0, 0, 1, 0.96])
 
-    out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
     print(f"[ok] saved {out_path}")

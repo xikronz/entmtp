@@ -220,7 +220,7 @@ logs/*
 
 scripts/old_pareto.py
 scripts/slurm/*
-entmtp/outputs/entropy/*
+entmtp/outputs/*
 entmtp/outputs/entropy/sharegpt.csv
 
 entmtp/outputs/pareto_acceptance/*.json
@@ -230,3 +230,7 @@ entmtp/outputs/logged_entropy/*.csv
 entmtp/outputs/regime_predictability.ipynb
 entmtp/sbatch
 entmtp/scripts/slurm/*
+Medusa/*
+entmtp/outputs/*
+entmtp/REVISION_PLAN.mkdocs
+entropy
